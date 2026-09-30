@@ -1,0 +1,38 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Environment / secrets — never commit real values, only the .example template
+.env
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Local Claude Code session config and generated analysis artifacts —
+# internal dev tooling, not application source.
+.claude/
+graphify-out/
+
+# Internal working notes from development, not user-facing documentation.
+Plan.md
+SectionWiseRemarksPlan.md
