@@ -8,11 +8,16 @@ const { computeContentHash, computeHmac } = require("../utils/reportSignature");
 const { logEvent } = require("../utils/auditLog");
 const LabSettings = require("../models/LabSettings");
 const { sanitizeRemarks } = require("../utils/sanitizeRemarks");
-const { isMailConfigured, sendMail } = require("../utils/mailer");
-const { renderReportPdf, mergePdfBuffers } = require("../utils/reportPdf");
+const { isMailConfigured } = require("../utils/mailer");
+const { renderReportPdf, renderReportsPdfs, mergePdfBuffers } = require("../utils/reportPdf");
 const Patient = require("../models/Patient");
 const { resolveAge, escapeRegex } = require("../utils/patientNormalize");
-const { buildReportEmail } = require("../utils/emailTemplate");
+const { pdfFileName, mergedPdfFileName, resolveAttachableReports } = require("../utils/reportAttachments");
+const { reportDeliveryQueue, JOB_OPTIONS } = require("../queue/queues");
+const { pingRedis } = require("../queue/connection");
+const { enqueueWithDedup } = require("../queue/enqueue");
+const { emailJobId, pdfJobId } = require("../jobs/jobIds");
+const pdfStore = require("../jobs/pdfStore");
 
 function parsePagination(req) {
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -52,68 +57,6 @@ function buildPatientSnapshot(patient, requested = {}) {
     contact: patient.phone || null,
     address: patient.address || null,
   };
-}
-
-// A file name a patient can make sense of in their downloads folder.
-function pdfFileName(report) {
-  const patient = (report.patientInfo?.name || "report").replace(/[^a-z0-9]+/gi, "-");
-  const type = (report.reportTypeCode || "report").replace(/[^a-z0-9]+/gi, "-");
-  return `${patient}-${type}.pdf`.toLowerCase();
-}
-
-// Same idea as pdfFileName, but for a merged multi-report PDF — falls back to
-// the plain single-report name when there's only one report after all.
-function mergedPdfFileName(primary, count) {
-  if (count <= 1) return pdfFileName(primary);
-  const patient = (primary.patientInfo?.name || "report").replace(/[^a-z0-9]+/gi, "-");
-  return `${patient}-${count}-reports.pdf`.toLowerCase();
-}
-
-// Validates a set of "extra" report ids against a primary report for the
-// combined-PDF / attach-to-email flows: each must exist, be signed, and
-// belong to the exact same linked patient as the primary. This is the guard
-// that stops a crafted request attaching a different patient's report — it's
-// checked by patientId equality, never by name (see /:id/related's comment
-// for why a name match isn't safe: the real database has eleven reports for
-// "Sagar"/male across five different recorded ages). Shared by POST /:id/email
-// and GET /:id/pdf?include= so this can't drift between the two call sites.
-async function resolveAttachableReports(primary, extraIds) {
-  const ids = Array.from(new Set((extraIds || []).map(String))).filter(
-    (rid) => rid !== String(primary._id)
-  );
-  if (!ids.length) return { ok: true, extras: [] };
-
-  if (!primary.patientId) {
-    return {
-      ok: false,
-      status: 400,
-      message: "This report isn't linked to a patient yet — link it before attaching other reports.",
-    };
-  }
-
-  const found = await Report.find({ _id: { $in: ids } });
-  if (found.length !== ids.length) {
-    return { ok: false, status: 400, message: "One or more of the selected reports could not be found" };
-  }
-  for (const extra of found) {
-    if (extra.status?.value !== "signed") {
-      return {
-        ok: false,
-        status: 400,
-        message: `"${extra.reportTypeCode}" is not signed and cannot be attached`,
-      };
-    }
-    const samePatient =
-      !!extra.patientId && String(extra.patientId) === String(primary.patientId);
-    if (!samePatient) {
-      return { ok: false, status: 400, message: "Every attached report must belong to the same patient" };
-    }
-  }
-
-  // Preserve the caller's requested order — $in doesn't guarantee it.
-  const byId = new Map(found.map((r) => [String(r._id), r]));
-  const extras = ids.map((rid) => byId.get(rid)).filter(Boolean);
-  return { ok: true, extras };
 }
 
 function reportLabel(report) {
@@ -776,10 +719,7 @@ router.get("/:id/pdf", isAuthenticated, async (req, res) => {
         return res.status(resolved.status).json({ success: false, message: resolved.message });
       }
       const allReports = [report, ...resolved.extras];
-      const buffers = [];
-      for (const r of allReports) {
-        buffers.push(await renderReportPdf(r._id, req.user));
-      }
+      const buffers = await renderReportsPdfs(allReports.map((r) => r._id), req.user);
       pdf = await mergePdfBuffers(buffers);
       filename = mergedPdfFileName(report, allReports.length);
     } else {
@@ -937,11 +877,14 @@ router.get("/:id/related", isAuthenticated, async (req, res) => {
 // Email a signed report (optionally with other signed reports for the same
 // patient attached) to the patient. Any authenticated role may send, matching
 // the Print gate — the real restriction is that the report must be signed.
+//
+// Validation stays synchronous (so bad input still gets an immediate 4xx/503,
+// exactly as before); the actual render→merge→send→persist pipeline is a
+// background job (api/jobs/reportEmail.js) — see the plan this followed for
+// why (it was blocking the request for as long as N sequential PDF renders
+// plus an SMTP round trip took). This responds 202 the moment the job is
+// queued; the frontend learns completion via the SSE push.
 router.post("/:id/email", isAuthenticated, async (req, res) => {
-  let primary = null;
-  let recipient = null;
-  let allReports = [];
-
   try {
     if (!isMailConfigured()) {
       return res.status(503).json({
@@ -951,7 +894,7 @@ router.post("/:id/email", isAuthenticated, async (req, res) => {
       });
     }
 
-    primary = await Report.findById(req.params.id);
+    const primary = await Report.findById(req.params.id);
     if (!primary) {
       return res.status(404).json({ success: false, message: "Report not found" });
     }
@@ -962,7 +905,7 @@ router.post("/:id/email", isAuthenticated, async (req, res) => {
       });
     }
 
-    recipient = (req.body?.recipient || primary.patientEmail || "").trim();
+    const recipient = (req.body?.recipient || primary.patientEmail || "").trim();
     if (!recipient) {
       return res.status(400).json({
         success: false,
@@ -978,126 +921,201 @@ router.post("/:id/email", isAuthenticated, async (req, res) => {
 
     // Extra attachments must be signed AND belong to the same patient — see
     // resolveAttachableReports' own comment for why this is checked by
-    // patientId equality rather than name equality.
+    // patientId equality rather than name equality. Re-validated again
+    // inside the job itself at run time, since a report's status can change
+    // between enqueue and processing.
     const extraIds = Array.isArray(req.body?.includeReportIds) ? req.body.includeReportIds : [];
     const resolved = await resolveAttachableReports(primary, extraIds);
     if (!resolved.ok) {
       return res.status(resolved.status).json({ success: false, message: resolved.message });
     }
+    const allReports = [primary, ...resolved.extras];
 
-    allReports = [primary, ...resolved.extras];
-
-    const [labSettings, types] = await Promise.all([
-      LabSettings.findOne(),
-      ReportType.find({ _id: { $in: allReports.map((r) => r.reportTypeId) } }).select("_id name"),
-    ]);
-    const typeName = new Map(types.map((t) => [String(t._id), t.name]));
-
-    // All reports render individually, then merge into ONE PDF — the patient
-    // gets a single combined document rather than N separate attachments.
-    const buffers = [];
-    for (const report of allReports) {
-      buffers.push(await renderReportPdf(report._id, req.user));
-    }
-    const mergedPdf = await mergePdfBuffers(buffers);
-    const attachments = [
-      {
-        filename: mergedPdfFileName(primary, allReports.length),
-        content: mergedPdf,
-        contentType: "application/pdf",
-      },
-    ];
-
-    const { subject, html, text } = buildReportEmail({
-      reports: allReports.map((r) => ({
-        reportTypeCode: r.reportTypeCode,
-        reportTypeName: typeName.get(String(r.reportTypeId)),
-        patientInfo: r.patientInfo,
-      })),
-      labSettings,
-      patientName: primary.patientInfo?.name || "Patient",
-    });
-
-    const { messageId } = await sendMail({
-      to: recipient,
-      subject,
-      html,
-      text,
-      attachments,
-      labSettings,
-    });
-
-    // Recorded on every report in the email, each carrying the full set, so
-    // any one report can answer "was this delivered, to whom, when, by whom".
-    const delivery = {
-      channel: "email",
-      recipient,
-      status: "sent",
-      messageId,
-      includedReportIds: allReports.map((r) => r._id),
-      sentBy: { userId: req.user._id, name: req.user.name, role: req.user.role },
-      sentAt: new Date(),
-    };
-    await Promise.all(
-      allReports.map((report) => {
-        report.deliveries.push(delivery);
-        // Remember the address so a re-send doesn't re-prompt.
-        if (!report.patientEmail) report.patientEmail = recipient;
-        return report.save();
-      })
-    );
-
-    await logEvent({
-      actor: req.user,
-      action: "report.email",
-      category: "Delivery",
-      description: `Emailed ${allReports.length} report(s) for ${primary.patientInfo?.name || "Unknown"} to ${recipient}`,
-      targetType: "Report",
-      targetId: primary._id,
-    });
-
-    res.json({
-      success: true,
-      message: "Report sent",
-      // "attachments" here means reports included, not literal files — the
-      // email always carries exactly one merged PDF now, but the frontend's
-      // success toast reads this as "N reports sent" and should stay correct.
-      data: { sent: true, recipient, messageId, attachments: allReports.length },
-    });
-  } catch (error) {
-    console.error("Error emailing report:", error);
-
-    // A failed send is exactly the case someone needs the history for.
-    if (primary && recipient) {
-      try {
-        primary.deliveries.push({
-          channel: "email",
-          recipient,
-          status: "failed",
-          error: error.message,
-          includedReportIds: allReports.map((r) => r._id),
-          sentBy: { userId: req.user._id, name: req.user.name, role: req.user.role },
-          sentAt: new Date(),
-        });
-        await primary.save();
-      } catch (_) {
-        // Recording the failure must never mask the original error.
-      }
-
-      await logEvent({
-        actor: req.user,
-        action: "report.email.failed",
-        category: "Delivery",
-        description: `Failed to email report for ${primary.patientInfo?.name || "Unknown"} to ${recipient}: ${error.message}`,
-        targetType: "Report",
-        targetId: primary._id,
+    // Fails fast (bounded retry, ~200ms) rather than letting queue.add()
+    // below hang on the BullMQ connection's own unbounded reconnect loop —
+    // that loop is correct behavior for a long-running server, but wrong to
+    // wait out inside a single HTTP request.
+    try {
+      await pingRedis();
+    } catch (_) {
+      return res.status(503).json({
+        success: false,
+        message: "Report delivery is temporarily unavailable — try again shortly.",
       });
     }
 
+    const jobId = emailJobId(primary._id, extraIds, recipient);
+    const { job, deduped } = await enqueueWithDedup(
+      reportDeliveryQueue,
+      "report-email",
+      {
+        primaryReportId: String(primary._id),
+        includeReportIds: extraIds.map(String),
+        recipient,
+        actor: { userId: String(req.user._id), name: req.user.name, role: req.user.role },
+        requestedAt: new Date().toISOString(),
+      },
+      jobId,
+      JOB_OPTIONS.reportEmail
+    );
+
+    res.status(202).json({
+      success: true,
+      message: deduped ? "Report send already in progress" : "Report queued for sending",
+      data: {
+        jobId: job.id,
+        status: "queued",
+        deduped,
+        recipient,
+        // "attachments" here means reports included, not literal files — the
+        // email always carries exactly one merged PDF, but the frontend's
+        // toast reads this as "N reports sent" and should stay correct.
+        attachments: allReports.length,
+      },
+    });
+  } catch (error) {
+    console.error("Error queuing report email:", error);
+    if (error.code === "ECONNREFUSED" || /redis/i.test(error.message || "")) {
+      return res.status(503).json({
+        success: false,
+        message: "Report delivery is temporarily unavailable — try again shortly.",
+      });
+    }
     res.status(500).json({
       success: false,
-      message: error.message || "Failed to send the report email",
+      message: error.message || "Failed to queue the report email",
     });
+  }
+});
+
+// Enqueue a PDF render job for a signed report (optionally merged with other
+// signed reports for the same patient — same ?include= semantics the old
+// synchronous GET /:id/pdf supported). Responds immediately with a jobId;
+// the frontend fetches the actual bytes from GET /pdf-jobs/:jobId/result
+// once the SSE push reports completion.
+router.post("/:id/pdf-jobs", isAuthenticated, async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id);
+    if (!report) {
+      return res.status(404).json({ success: false, message: "Report not found" });
+    }
+    if (report.status?.value !== "signed") {
+      return res.status(400).json({
+        success: false,
+        message: "Only a signed report can be exported as a PDF",
+      });
+    }
+
+    const includeIds =
+      typeof req.body?.includeReportIds !== "undefined"
+        ? (Array.isArray(req.body.includeReportIds) ? req.body.includeReportIds : [])
+        : typeof req.query.include === "string" && req.query.include.trim()
+        ? req.query.include.split(",").map((s) => s.trim()).filter(Boolean)
+        : [];
+
+    const resolved = await resolveAttachableReports(report, includeIds);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ success: false, message: resolved.message });
+    }
+    const allReports = [report, ...resolved.extras];
+    const filename = mergedPdfFileName(report, allReports.length);
+
+    try {
+      await pingRedis();
+    } catch (_) {
+      return res.status(503).json({
+        success: false,
+        message: "PDF generation is temporarily unavailable — try again shortly.",
+      });
+    }
+
+    const jobId = pdfJobId(report._id, includeIds);
+    const { job, deduped } = await enqueueWithDedup(
+      reportDeliveryQueue,
+      "report-pdf",
+      {
+        primaryReportId: String(report._id),
+        includeReportIds: includeIds.map(String),
+        actor: { userId: String(req.user._id), name: req.user.name, role: req.user.role },
+        requestedAt: new Date().toISOString(),
+      },
+      jobId,
+      JOB_OPTIONS.reportPdf
+    );
+
+    res.status(202).json({ success: true, data: { jobId: job.id, status: "queued", deduped, filename } });
+  } catch (error) {
+    console.error("Error queuing report PDF render:", error);
+    if (error.code === "ECONNREFUSED" || /redis/i.test(error.message || "")) {
+      return res.status(503).json({
+        success: false,
+        message: "PDF generation is temporarily unavailable — try again shortly.",
+      });
+    }
+    res.status(500).json({ success: false, message: "Failed to queue the PDF render" });
+  }
+});
+
+// Reconciliation endpoint — called once after an SSE reconnect for any job
+// the client still considers open, not polled on an interval.
+router.get("/pdf-jobs/:jobId", isAuthenticated, async (req, res) => {
+  try {
+    const job = await reportDeliveryQueue.getJob(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ success: false, message: "Job not found" });
+    }
+    if (String(job.data?.actor?.userId) !== String(req.user._id)) {
+      return res.status(403).json({ success: false, message: "Not your job" });
+    }
+    const state = await job.getState();
+    res.json({
+      success: true,
+      data: {
+        jobId: job.id,
+        state,
+        progress: job.progress,
+        returnvalue: job.returnvalue,
+        failedReason: job.failedReason,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching PDF job state:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch job state" });
+  }
+});
+
+// Fetches a completed report-pdf job's bytes. Single-use: deletes the Redis
+// blob after a successful send so the common case frees it immediately
+// rather than waiting out PDF_RESULT_TTL_SECONDS.
+router.get("/pdf-jobs/:jobId/result", isAuthenticated, async (req, res) => {
+  try {
+    const job = await reportDeliveryQueue.getJob(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ success: false, message: "Job not found" });
+    }
+    // A jobId is not a secret — without this check it would be a bearer
+    // token for another user's patient PDF.
+    if (String(job.data?.actor?.userId) !== String(req.user._id)) {
+      return res.status(403).json({ success: false, message: "Not your job" });
+    }
+
+    const buffer = await pdfStore.getBuffer(req.params.jobId);
+    if (!buffer || !buffer.length) {
+      return res.status(410).json({
+        success: false,
+        message: "That download has expired — generate it again.",
+      });
+    }
+
+    const filename = job.returnvalue?.filename || "report.pdf";
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Length", buffer.length);
+    res.send(buffer);
+    await pdfStore.del(req.params.jobId);
+  } catch (error) {
+    console.error("Error fetching PDF job result:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch the rendered PDF" });
   }
 });
 

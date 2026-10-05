@@ -27,7 +27,18 @@ exports.isAuthenticated = async (req, res, next) => {
     
     // Verify token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
+
+    // A token carrying a `purpose` claim (e.g. the short-lived SSE stream
+    // token minted by POST /api/events/token) is single-purpose by design
+    // and must never double as a full API credential — reject it here so a
+    // leaked stream token can't be replayed against the rest of the API.
+    if (decoded.purpose) {
+      return res.status(401).json({
+        success: false,
+        message: 'This token cannot be used to authenticate API requests',
+      });
+    }
+
     // Find user by id
     const user = await User.findById(decoded.id);
     

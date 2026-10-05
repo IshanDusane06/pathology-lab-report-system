@@ -24,6 +24,11 @@ const deliverySchema = new mongoose.Schema({
   status: { type: String, enum: ['sent', 'failed'], required: true },
   error: { type: String, default: null },
   messageId: { type: String, default: null },
+  // The BullMQ job that produced this delivery attempt. Lets a retried job
+  // check "did my previous attempt already send?" before calling sendMail
+  // again, so a worker crash between send and persist can't double-email a
+  // patient. Null for deliveries predating the job queue.
+  jobId: { type: String, default: null },
   // Every report attached to the same email, so any one report can answer
   // "what went out together with this?" on its own.
   includedReportIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Report' }],

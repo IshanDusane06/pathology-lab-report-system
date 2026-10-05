@@ -161,6 +161,35 @@ async function renderReportPdf(reportId, user) {
   }
 }
 
+// Renders several reports concurrently instead of one at a time. Bounded
+// (not a plain Promise.all) because each render is a real Chromium tab that
+// boots the whole frontend SPA against two 30s timeouts (networkidle0 +
+// data-report-ready) — too many simultaneous tabs on a small box make those
+// timeouts fire instead of just taking longer, trading a slow success for a
+// hard failure. The shared browser from getBrowser() already supports
+// multiple concurrent pages, so this needed no change to renderReportPdf.
+//
+// Results are written into a pre-sized array by index, never pushed, so
+// completion order (which the concurrency means is NOT input order) can
+// never reorder pages in the caller's merged PDF — the worst possible
+// failure mode here, since it would ship silently wrong-order pages in a
+// patient's report rather than erroring.
+async function renderReportsPdfs(reportIds, user, { concurrency } = {}) {
+  const limit = Math.max(1, concurrency || Number(process.env.PDF_RENDER_CONCURRENCY) || 3);
+  const results = new Array(reportIds.length);
+  let nextIndex = 0;
+
+  async function runNext() {
+    const i = nextIndex++;
+    if (i >= reportIds.length) return;
+    results[i] = await renderReportPdf(reportIds[i], user);
+    return runNext();
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, reportIds.length) }, runNext));
+  return results;
+}
+
 // Concatenates already-rendered per-report PDF buffers into one document, in
 // the given order. Each source report keeps rendering exactly as it does
 // standalone (own letterhead, own signature block) — this is concatenation
@@ -184,4 +213,4 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-module.exports = { renderReportPdf, mergePdfBuffers, closeBrowser };
+module.exports = { renderReportPdf, renderReportsPdfs, mergePdfBuffers, closeBrowser };
