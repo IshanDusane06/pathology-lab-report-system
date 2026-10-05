@@ -1,12 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const LabSettings = require('../models/LabSettings');
-const Report = require('../models/Report');
 const { isAuthenticated, isAdmin } = require('../middleware/auth');
-const { computeHmac } = require('../utils/reportSignature');
 const { isMailConfigured, sendMail, smtpConfig } = require('../utils/mailer');
 const { buildTestEmail } = require('../utils/emailTemplate');
 const { logEvent } = require('../utils/auditLog');
+const { signatureReverifyQueue, JOB_OPTIONS } = require('../queue/queues');
+const { enqueueWithDedup } = require('../queue/enqueue');
+const { REVERIFY_ALL_JOB_ID } = require('../jobs/jobIds');
+const { pingRedis } = require('../queue/connection');
 
 async function getOrCreateSettings() {
   let settings = await LabSettings.findOne();
@@ -77,35 +79,48 @@ router.put('/', [isAuthenticated, isAdmin], async (req, res) => {
 // unsigned-then-re-edited report would spuriously "fail" that check, since
 // its content has correctly changed since an earlier, now-invalidated
 // signature. HMAC-over-stored-hash is the actual integrity guarantee.
+//
+// This used to scan every signed report in the lab synchronously inside the
+// request — unbounded, no pagination, only getting slower as reports
+// accumulate. It's now a background job (api/jobs/signatureReverify.js)
+// that batches with a lean cursor; this just enqueues it and responds
+// immediately. The admin UI learns completion via the SSE push.
 router.post('/reverify-signatures', [isAuthenticated, isAdmin], async (req, res) => {
   try {
-    const reports = await Report.find({ 'signatures.0': { $exists: true } });
-
-    let checked = 0;
-    const mismatches = [];
-
-    for (const report of reports) {
-      report.signatures.forEach((sig, index) => {
-        if (!sig.contentHash || !sig.hmac || sig.algorithm === 'legacy-backfill') return;
-        checked += 1;
-        const expectedHmac = computeHmac(sig.contentHash);
-        if (expectedHmac !== sig.hmac) {
-          mismatches.push({ reportId: report._id, signatureIndex: index });
-        }
+    try {
+      await pingRedis();
+    } catch (_) {
+      return res.status(503).json({
+        success: false,
+        message: 'Signature re-verification is temporarily unavailable — try again shortly.',
       });
     }
 
-    const settings = await getOrCreateSettings();
-    settings.lastVerification = { at: new Date(), checked, mismatches: mismatches.length };
-    await settings.save();
+    const { job, deduped } = await enqueueWithDedup(
+      signatureReverifyQueue,
+      'reverify-all',
+      {
+        actor: { userId: String(req.user._id), name: req.user.name, role: req.user.role },
+        requestedAt: new Date().toISOString(),
+      },
+      REVERIFY_ALL_JOB_ID,
+      JOB_OPTIONS.reverifyAll
+    );
 
-    res.json({
+    res.status(202).json({
       success: true,
-      data: { checked, mismatches, verifiedAt: settings.lastVerification.at },
+      message: deduped ? 'A re-verification sweep is already running' : 'Re-verification started',
+      data: { jobId: job.id, status: 'queued', alreadyRunning: deduped },
     });
   } catch (error) {
-    console.error('Error re-verifying signatures:', error);
-    res.status(500).json({ success: false, message: 'Failed to re-verify signatures' });
+    console.error('Error queuing signature re-verification:', error);
+    if (error.code === 'ECONNREFUSED' || /redis/i.test(error.message || '')) {
+      return res.status(503).json({
+        success: false,
+        message: 'Signature re-verification is temporarily unavailable — try again shortly.',
+      });
+    }
+    res.status(500).json({ success: false, message: 'Failed to start re-verification' });
   }
 });
 
