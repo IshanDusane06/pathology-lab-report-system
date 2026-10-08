@@ -99,6 +99,11 @@ exports.hasRole = (requiredRole) => {
 };
 
 // Convenience middleware functions
+// Exported so role comparisons outside this module (e.g. the Activity
+// feed's admin-sees-all scoping) use the same constants rather than bare
+// string literals.
+exports.ROLES = ROLES;
+
 exports.isDoctor = exports.hasRole(ROLES.DOCTOR);
 exports.isTechnician = exports.hasRole(ROLES.TECHNICIAN);
 exports.isAdmin = exports.hasRole(ROLES.ADMIN);

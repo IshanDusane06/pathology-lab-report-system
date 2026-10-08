@@ -2,12 +2,8 @@ const express = require('express');
 const router = express.Router();
 const AuditLog = require('../models/AuditLog');
 const { isAuthenticated, isAdmin } = require('../middleware/auth');
+const { parsePagination } = require('../utils/pagination');
 
-function parsePagination(req) {
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
-  return { page, limit, skip: (page - 1) * limit };
-}
 
 // List audit events (Admin only) — paginated, newest first, optional category filter.
 router.get('/', [isAuthenticated, isAdmin], async (req, res) => {

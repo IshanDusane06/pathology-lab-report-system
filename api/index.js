@@ -39,6 +39,7 @@ const auditRoutes = require('./routes/audit');
 const labSettingsRoutes = require('./routes/labSettings');
 const patientsRoutes = require('./routes/patients');
 const eventsRoutes = require('./routes/events');
+const activityRoutes = require('./routes/activity');
 
 // Use routes
 app.use('/api/reports', reportsRoutes);
@@ -49,6 +50,7 @@ app.use('/api/audit', auditRoutes);
 app.use('/api/lab-settings', labSettingsRoutes);
 app.use('/api/patients', patientsRoutes);
 app.use('/api/events', eventsRoutes);
+app.use('/api/activity', activityRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

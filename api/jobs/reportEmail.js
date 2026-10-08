@@ -40,10 +40,17 @@ async function reportEmailJob(job) {
     // Retry-safety: if a previous attempt of THIS job already sent (and only
     // the follow-up persistence step failed before the worker died), don't
     // send the patient a second email — just re-run the persistence.
-    if (job.attemptsMade > 0) {
+    //
+    // Matched on activityId, NOT jobId: jobIds are deterministic content
+    // hashes and enqueueWithDedup re-adds the SAME id for a deliberate
+    // resend, so a jobId match would find the ORIGINAL send's delivery and
+    // silently skip a resend the user explicitly asked for. activityId is
+    // unique per user action, so it only ever matches this job's own earlier
+    // attempt.
+    if (job.attemptsMade > 0 && job.data.activityId) {
       const fresh = await Report.findById(primary._id);
       const alreadySent = (fresh?.deliveries || []).some(
-        (d) => d.jobId === job.id && d.status === 'sent'
+        (d) => String(d.activityId) === String(job.data.activityId) && d.status === 'sent'
       );
       if (alreadySent) {
         return { recipient, attachments: allReports.length, resent: false, alreadySent: true };
@@ -91,6 +98,7 @@ async function reportEmailJob(job) {
       recipient,
       status: 'sent',
       messageId,
+      activityId: job.data.activityId || null,
       jobId: job.id,
       includedReportIds: allReports.map((r) => r._id),
       sentBy: { userId: actorUser._id, name: actorUser.name, role: actorUser.role },
@@ -125,6 +133,7 @@ async function reportEmailJob(job) {
           recipient,
           status: 'failed',
           error: error.message,
+          activityId: job.data.activityId || null,
           jobId: job.id,
           includedReportIds: (allReports || [primary]).map((r) => r._id),
           sentBy: { userId: actorUser._id, name: actorUser.name, role: actorUser.role },

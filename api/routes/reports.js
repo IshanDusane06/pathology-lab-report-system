@@ -2,7 +2,8 @@ const express = require("express");
 const router = express.Router();
 const Report = require("../models/Report");
 const ReportType = require("../models/ReportType");
-const { isAuthenticated } = require("../middleware/auth");
+const mongoose = require("mongoose");
+const { isAuthenticated, ROLES } = require("../middleware/auth");
 const { canEditReportContent, assertTransition, canDeleteReport } = require("../middleware/reportAccess");
 const { computeContentHash, computeHmac } = require("../utils/reportSignature");
 const { logEvent } = require("../utils/auditLog");
@@ -18,11 +19,29 @@ const { pingRedis } = require("../queue/connection");
 const { enqueueWithDedup } = require("../queue/enqueue");
 const { emailJobId, pdfJobId } = require("../jobs/jobIds");
 const pdfStore = require("../jobs/pdfStore");
+const { parsePagination } = require("../utils/pagination");
+const JobActivity = require("../models/JobActivity");
+const {
+  buildSubject,
+  startActivity,
+  markDownloaded,
+  markExpired,
+  linkRetry,
+  autoLinkPriorFailures,
+} = require("../utils/jobActivity");
 
-function parsePagination(req) {
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
-  return { page, limit, skip: (page - 1) * limit };
+// Resolves an optional retryOfActivityId from a request body: the row must
+// exist, be the same kind, and belong to the caller (or an Admin). Without
+// the ownership check a user could clear someone else's "needs retry" count
+// by passing their activity id.
+async function resolveRetryOf(req, kind) {
+  const raw = req.body?.retryOfActivityId;
+  if (!raw || !mongoose.Types.ObjectId.isValid(raw)) return null;
+  const prior = await JobActivity.findById(raw).select("_id kind actor");
+  if (!prior || prior.kind !== kind) return null;
+  const isOwner = String(prior.actor?.userId) === String(req.user._id);
+  if (!isOwner && req.user.role !== ROLES.ADMIN) return null;
+  return prior._id;
 }
 
 // Deliberately permissive but structurally real — enough to catch typos and
@@ -712,6 +731,7 @@ router.get("/:id/pdf", isAuthenticated, async (req, res) => {
 
     let pdf;
     let filename;
+    let resolvedExtras = [];
 
     if (includeIds.length) {
       const resolved = await resolveAttachableReports(report, includeIds);
@@ -719,6 +739,7 @@ router.get("/:id/pdf", isAuthenticated, async (req, res) => {
         return res.status(resolved.status).json({ success: false, message: resolved.message });
       }
       const allReports = [report, ...resolved.extras];
+      resolvedExtras = resolved.extras;
       const buffers = await renderReportsPdfs(allReports.map((r) => r._id), req.user);
       pdf = await mergePdfBuffers(buffers);
       filename = mergedPdfFileName(report, allReports.length);
@@ -731,6 +752,34 @@ router.get("/:id/pdf", isAuthenticated, async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.setHeader("Content-Length", pdf.length);
     res.send(pdf);
+
+    // Record it in the Activity feed. This route has no job at all (it
+    // renders and streams inside the request), so the row is born finished:
+    // source 'direct', completed and downloaded in the same instant. Without
+    // this, PDF rows would be structurally empty until the frontend migrates
+    // onto POST /:id/pdf-jobs. Fire-and-forget — the file already shipped.
+    const allRows = includeIds.length ? [report, ...(resolvedExtras || [])] : [report];
+    const patient = report.patientId
+      ? await Patient.findById(report.patientId).select("patientId name")
+      : null;
+    const now = new Date();
+    await startActivity({
+      activityId: new mongoose.Types.ObjectId(),
+      kind: "pdf",
+      source: "direct",
+      actor: req.user,
+      status: "completed",
+      maxAttempts: 1,
+      request: {
+        primaryReportId: report._id,
+        includeReportIds: allRows.slice(1).map((r) => r._id),
+      },
+      subject: buildSubject({ allReports: allRows, patient }),
+      result: { filename, bytes: pdf.length },
+      finishedAt: now,
+      downloadedAt: now,
+      downloadedBy: { userId: req.user._id, name: req.user.name, role: req.user.role },
+    });
   } catch (error) {
     console.error("Error rendering report PDF:", error);
     res.status(500).json({
@@ -944,6 +993,12 @@ router.post("/:id/email", isAuthenticated, async (req, res) => {
       });
     }
 
+    const retryOfActivityId = await resolveRetryOf(req, "email");
+
+    // Minted BEFORE enqueue so it can ride inside job.data from the very
+    // first queue.add — job.updateData() after the fact races the worker,
+    // which can pick the job up before the update lands.
+    const activityId = new mongoose.Types.ObjectId();
     const jobId = emailJobId(primary._id, extraIds, recipient);
     const { job, deduped } = await enqueueWithDedup(
       reportDeliveryQueue,
@@ -953,19 +1008,58 @@ router.post("/:id/email", isAuthenticated, async (req, res) => {
         includeReportIds: extraIds.map(String),
         recipient,
         actor: { userId: String(req.user._id), name: req.user.name, role: req.user.role },
+        activityId: String(activityId),
         requestedAt: new Date().toISOString(),
       },
       jobId,
       JOB_OPTIONS.reportEmail
     );
 
+    // Whether THIS request is the one that created the job — not whether the
+    // job happens to be in flight. queue.add() with an existing jobId returns
+    // the existing job carrying its ORIGINAL creator's data, so an activityId
+    // match means we created it. The raw `deduped` flag can't be used here:
+    // an in-process worker often picks a brand-new job up before getState()
+    // runs, which would report deduped on a job we just created and skip
+    // writing its row entirely.
+    const startedByThisRequest = String(job.data?.activityId) === String(activityId);
+    const joined = !startedByThisRequest;
+    const effectiveActivityId = startedByThisRequest ? activityId : job.data?.activityId || null;
+
+    if (startedByThisRequest) {
+      const patient = primary.patientId
+        ? await Patient.findById(primary.patientId).select("patientId name")
+        : null;
+      await startActivity({
+        activityId,
+        kind: "email",
+        jobId: job.id,
+        actor: req.user,
+        maxAttempts: JOB_OPTIONS.reportEmail.attempts || 1,
+        request: {
+          primaryReportId: primary._id,
+          includeReportIds: resolved.extras.map((r) => r._id),
+          recipient,
+          retryOfActivityId,
+        },
+        subject: buildSubject({ allReports, patient }),
+      });
+      if (retryOfActivityId) {
+        await linkRetry({ oldActivityId: retryOfActivityId, newActivityId: activityId });
+      }
+      // Catches retries started from elsewhere (e.g. the report page), which
+      // carry no explicit retryOfActivityId.
+      await autoLinkPriorFailures({ jobId: job.id, kind: "email", newActivityId: activityId });
+    }
+
     res.status(202).json({
       success: true,
-      message: deduped ? "Report send already in progress" : "Report queued for sending",
+      message: joined ? "Report send already in progress" : "Report queued for sending",
       data: {
         jobId: job.id,
+        activityId: effectiveActivityId ? String(effectiveActivityId) : null,
         status: "queued",
-        deduped,
+        deduped: joined,
         recipient,
         // "attachments" here means reports included, not literal files — the
         // email always carries exactly one merged PDF, but the frontend's
@@ -1029,6 +1123,9 @@ router.post("/:id/pdf-jobs", isAuthenticated, async (req, res) => {
       });
     }
 
+    const retryOfActivityId = await resolveRetryOf(req, "pdf");
+
+    const activityId = new mongoose.Types.ObjectId();
     const jobId = pdfJobId(report._id, includeIds);
     const { job, deduped } = await enqueueWithDedup(
       reportDeliveryQueue,
@@ -1037,13 +1134,55 @@ router.post("/:id/pdf-jobs", isAuthenticated, async (req, res) => {
         primaryReportId: String(report._id),
         includeReportIds: includeIds.map(String),
         actor: { userId: String(req.user._id), name: req.user.name, role: req.user.role },
+        activityId: String(activityId),
         requestedAt: new Date().toISOString(),
       },
       jobId,
       JOB_OPTIONS.reportPdf
     );
 
-    res.status(202).json({ success: true, data: { jobId: job.id, status: "queued", deduped, filename } });
+    // See the email route above for why this is an activityId comparison
+    // rather than the raw `deduped` flag.
+    const startedByThisRequest = String(job.data?.activityId) === String(activityId);
+    const joined = !startedByThisRequest;
+    const effectiveActivityId = startedByThisRequest ? activityId : job.data?.activityId || null;
+
+    if (startedByThisRequest) {
+      const patient = report.patientId
+        ? await Patient.findById(report.patientId).select("patientId name")
+        : null;
+      await startActivity({
+        activityId,
+        kind: "pdf",
+        jobId: job.id,
+        actor: req.user,
+        maxAttempts: JOB_OPTIONS.reportPdf.attempts || 1,
+        request: {
+          primaryReportId: report._id,
+          includeReportIds: resolved.extras.map((r) => r._id),
+          retryOfActivityId,
+        },
+        subject: buildSubject({ allReports, patient }),
+        // Seeded now so a queued row can show its filename before the render
+        // finishes; the worker overwrites it from the job's return value.
+        result: { filename },
+      });
+      if (retryOfActivityId) {
+        await linkRetry({ oldActivityId: retryOfActivityId, newActivityId: activityId });
+      }
+      await autoLinkPriorFailures({ jobId: job.id, kind: "pdf", newActivityId: activityId });
+    }
+
+    res.status(202).json({
+      success: true,
+      data: {
+        jobId: job.id,
+        activityId: effectiveActivityId ? String(effectiveActivityId) : null,
+        status: "queued",
+        deduped: joined,
+        filename,
+      },
+    });
   } catch (error) {
     console.error("Error queuing report PDF render:", error);
     if (error.code === "ECONNREFUSED" || /redis/i.test(error.message || "")) {
@@ -1064,7 +1203,10 @@ router.get("/pdf-jobs/:jobId", isAuthenticated, async (req, res) => {
     if (!job) {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
-    if (String(job.data?.actor?.userId) !== String(req.user._id)) {
+    // An Admin may read any user's job state (the Activity feed is lab-wide
+    // for them). Fetching the BYTES stays owner-only — see the result route.
+    const isOwner = String(job.data?.actor?.userId) === String(req.user._id);
+    if (!isOwner && req.user.role !== ROLES.ADMIN) {
       return res.status(403).json({ success: false, message: "Not your job" });
     }
     const state = await job.getState();
@@ -1095,12 +1237,20 @@ router.get("/pdf-jobs/:jobId/result", isAuthenticated, async (req, res) => {
     }
     // A jobId is not a secret — without this check it would be a bearer
     // token for another user's patient PDF.
+    //
+    // Deliberately owner-only even for an Admin, unlike the state route
+    // above: the blob is single-use, so an Admin opening someone else's
+    // ready PDF would consume THEIR download. Admins regenerate their own
+    // copy instead.
     if (String(job.data?.actor?.userId) !== String(req.user._id)) {
       return res.status(403).json({ success: false, message: "Not your job" });
     }
 
     const buffer = await pdfStore.getBuffer(req.params.jobId);
     if (!buffer || !buffer.length) {
+      // Flip the row to expired so it stops offering a Download that would
+      // only 410 again.
+      await markExpired(job.data?.activityId);
       return res.status(410).json({
         success: false,
         message: "That download has expired — generate it again.",
@@ -1113,6 +1263,7 @@ router.get("/pdf-jobs/:jobId/result", isAuthenticated, async (req, res) => {
     res.setHeader("Content-Length", buffer.length);
     res.send(buffer);
     await pdfStore.del(req.params.jobId);
+    await markDownloaded(job.data?.activityId, req.user);
   } catch (error) {
     console.error("Error fetching PDF job result:", error);
     res.status(500).json({ success: false, message: "Failed to fetch the rendered PDF" });
