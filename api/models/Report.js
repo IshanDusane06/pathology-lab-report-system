@@ -24,6 +24,10 @@ const deliverySchema = new mongoose.Schema({
   status: { type: String, enum: ['sent', 'failed'], required: true },
   error: { type: String, default: null },
   messageId: { type: String, default: null },
+  // The JobActivity row (one per user action) this attempt belongs to. Unlike
+  // jobId below, this is unique per send — which is what makes the retry
+  // short-circuit in jobs/reportEmail.js correct for a deliberate resend.
+  activityId: { type: mongoose.Schema.Types.ObjectId, default: null },
   // The BullMQ job that produced this delivery attempt. Lets a retried job
   // check "did my previous attempt already send?" before calling sendMail
   // again, so a worker crash between send and persist can't double-email a

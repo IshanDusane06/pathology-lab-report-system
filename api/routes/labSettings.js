@@ -9,6 +9,8 @@ const { signatureReverifyQueue, JOB_OPTIONS } = require('../queue/queues');
 const { enqueueWithDedup } = require('../queue/enqueue');
 const { REVERIFY_ALL_JOB_ID } = require('../jobs/jobIds');
 const { pingRedis } = require('../queue/connection');
+const mongoose = require('mongoose');
+const { startActivity, buildSubject } = require('../utils/jobActivity');
 
 async function getOrCreateSettings() {
   let settings = await LabSettings.findOne();
@@ -96,21 +98,48 @@ router.post('/reverify-signatures', [isAuthenticated, isAdmin], async (req, res)
       });
     }
 
+    const activityId = new mongoose.Types.ObjectId();
     const { job, deduped } = await enqueueWithDedup(
       signatureReverifyQueue,
       'reverify-all',
       {
         actor: { userId: String(req.user._id), name: req.user.name, role: req.user.role },
+        activityId: String(activityId),
         requestedAt: new Date().toISOString(),
       },
       REVERIFY_ALL_JOB_ID,
       JOB_OPTIONS.reverifyAll
     );
 
+    // The sweep uses a fixed singleton job id, so joining an in-flight sweep
+    // (someone clicking while one runs) is the normal case here rather than
+    // an edge case. Tested by activityId rather than the raw `deduped` flag
+    // for the same reason as the report routes: a job we just created can
+    // already be active by the time its state is read.
+    const startedByThisRequest = String(job.data?.activityId) === String(activityId);
+    const joined = !startedByThisRequest;
+    const effectiveActivityId = startedByThisRequest ? activityId : job.data?.activityId || null;
+
+    if (startedByThisRequest) {
+      await startActivity({
+        activityId,
+        kind: 'sweep',
+        jobId: job.id,
+        actor: req.user,
+        maxAttempts: JOB_OPTIONS.reverifyAll.attempts || 1,
+        subject: buildSubject({ allReports: [], label: 'Whole lab' }),
+      });
+    }
+
     res.status(202).json({
       success: true,
-      message: deduped ? 'A re-verification sweep is already running' : 'Re-verification started',
-      data: { jobId: job.id, status: 'queued', alreadyRunning: deduped },
+      message: joined ? 'A re-verification sweep is already running' : 'Re-verification started',
+      data: {
+        jobId: job.id,
+        activityId: effectiveActivityId ? String(effectiveActivityId) : null,
+        status: 'queued',
+        alreadyRunning: joined,
+      },
     });
   } catch (error) {
     console.error('Error queuing signature re-verification:', error);
