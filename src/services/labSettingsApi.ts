@@ -34,10 +34,16 @@ export interface LabSettings {
   lastVerification: { at: string | null; checked: number; mismatches: number };
 }
 
-export interface ReverifyResult {
-  checked: number;
-  mismatches: { reportId: string; signatureIndex: number }[];
-  verifiedAt: string;
+// A 202 receipt, not a result. The sweep runs as a background job, so the
+// counts arrive later as an SSE job event (and are persisted to
+// lastVerification). `alreadyRunning` means a sweep was already in flight and
+// this request joined it — the sweep is a lab-wide singleton, so that is the
+// normal outcome of two admins clicking, not an error.
+export interface QueuedReverify {
+  jobId: string;
+  activityId: string | null;
+  status: 'queued';
+  alreadyRunning: boolean;
 }
 
 function authHeaders() {
@@ -84,7 +90,7 @@ export const labSettingsApi = {
     }
   },
 
-  reverifySignatures: async (): Promise<ReverifyResult> => {
+  reverifySignatures: async (): Promise<QueuedReverify> => {
     try {
       const response = await fetch(`${API_BASE_URL}/lab-settings/reverify-signatures`, {
         method: 'POST',

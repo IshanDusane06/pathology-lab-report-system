@@ -30,6 +30,7 @@ import { Pagination } from "../services/api";
 import ReportStatusBadge, { ReportStatusValue, STATUS_CONFIG } from "@/components/report/ReportStatusBadge";
 import { canEditReportContent } from "@/lib/reportAccess";
 import SendReportEmailDialog from "@/components/report/SendReportEmailDialog";
+import { usePdfJob, saveBlobAs } from "@/hooks/usePdfJob";
 
 const PAGE_SIZE = 20;
 
@@ -59,6 +60,7 @@ const Reports = () => {
   const [loading, setLoading] = useState(true);
   const [reportTypes, setReportTypes] = useState<Record<string, string>>({});
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const { requestPdf } = usePdfJob();
   const [emailTarget, setEmailTarget] = useState<IReport | null>(null);
 
   const memoizedGetReportTypeName = useCallback(
@@ -204,15 +206,10 @@ const Reports = () => {
     if (!reportId) return;
     setDownloadingId(reportId);
     try {
-      const blob = await reportsApi.getReportPdf(reportId);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `${(report.patientInfo?.name || "report").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${report.reportTypeCode || "report"}.pdf`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
+      // Queued server-side render — the row's button stays disabled until the
+      // bytes arrive. The server names the file; see ReportDetail's copy.
+      const { blob, filename } = await requestPdf(reportId);
+      saveBlobAs(blob, filename);
     } catch (error) {
       toast({
         title: "Couldn't generate the PDF",
