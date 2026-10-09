@@ -7,7 +7,14 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/components/ui/use-toast";
-import { labSettingsApi, LabSettings } from "@/services/labSettingsApi";
+import { labSettingsApi, LabSettings, QueuedReverify } from "@/services/labSettingsApi";
+import { useJobOutcome } from "@/hooks/useJobOutcome";
+
+interface SweepProgress {
+  reportsScanned: number;
+  checked: number;
+  mismatches: number;
+}
 
 const AdminLabSettingsTab: React.FC = () => {
   const [settings, setSettings] = useState<LabSettings | null>(null);
@@ -15,16 +22,24 @@ const AdminLabSettingsTab: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [reverifying, setReverifying] = useState(false);
   const [testingEmail, setTestingEmail] = useState(false);
+  // Live counts while a sweep runs. There is no total to divide by — the job
+  // doesn't know how many reports it will see up front — so this is a running
+  // tally, not a percentage.
+  const [sweepProgress, setSweepProgress] = useState<SweepProgress | null>(null);
+  const { waitForJob } = useJobOutcome();
 
-  const load = async () => {
-    setLoading(true);
+  // `quiet` skips the loading flag, which the whole tab's early-return
+  // spinner keys off — used to refresh the verification card after a sweep
+  // without blanking the settings form the admin is looking at.
+  const load = async ({ quiet = false }: { quiet?: boolean } = {}) => {
+    if (!quiet) setLoading(true);
     try {
       const data = await labSettingsApi.getLabSettings();
       setSettings(data);
     } catch (error) {
       toast({ title: "Error", description: "Failed to load lab settings", variant: "destructive" });
     } finally {
-      setLoading(false);
+      if (!quiet) setLoading(false);
     }
   };
 
@@ -73,25 +88,82 @@ const AdminLabSettingsTab: React.FC = () => {
     }
   };
 
+  // The sweep runs as a background job, so the response to this is only a
+  // receipt — the counts arrive later over the live event stream. It is also
+  // the one flow with genuine incremental progress (it reports per batch of
+  // reports scanned), which is why it shows a running count rather than a
+  // bare spinner.
   const handleReverify = async () => {
     setReverifying(true);
+    setSweepProgress(null);
+
+    let queued: QueuedReverify;
     try {
-      const result = await labSettingsApi.reverifySignatures();
-      await load();
-      toast({
-        title: result.mismatches.length === 0 ? "All signatures verified" : "Mismatches found",
-        description: `Checked ${result.checked} signature${result.checked === 1 ? "" : "s"}, ${result.mismatches.length} mismatch${result.mismatches.length === 1 ? "" : "es"}.`,
-        variant: result.mismatches.length === 0 ? "default" : "destructive",
-      });
+      queued = await labSettingsApi.reverifySignatures();
     } catch (error) {
       toast({
         title: "Error",
         description: error instanceof Error ? error.message : "Failed to re-verify signatures",
         variant: "destructive",
       });
-    } finally {
       setReverifying(false);
+      return;
     }
+
+    toast({
+      title: queued.alreadyRunning ? "Sweep already running" : "Sweep started",
+      description: queued.alreadyRunning
+        ? "A re-verification is already in progress."
+        : "Checking every signature in the lab.",
+    });
+
+    const outcome = await waitForJob({
+      activityId: queued.activityId,
+      jobId: queued.jobId,
+      onProgress: (event) => {
+        if (event.status !== "progress") return;
+        setSweepProgress({
+          reportsScanned: event.data.reportsScanned ?? 0,
+          checked: event.data.checked ?? 0,
+          mismatches: typeof event.data.mismatches === "number" ? event.data.mismatches : 0,
+        });
+      },
+    });
+
+    setReverifying(false);
+    setSweepProgress(null);
+
+    if (outcome.kind === "timeout") {
+      // Expected when an Admin joins a sweep someone else started: events are
+      // delivered to the user who started the job, so this one never hears
+      // about it. The stored result is still correct — just re-read it.
+      await load({ quiet: true });
+      toast({
+        title: "Still verifying",
+        description: "No result yet. The card updates once the sweep finishes.",
+      });
+      return;
+    }
+
+    if (outcome.kind === "failed") {
+      toast({
+        title: "Couldn't verify signatures",
+        description: outcome.reason,
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Refresh before the toast so the card and the message agree.
+    await load({ quiet: true });
+
+    const checked = outcome.data.checked ?? 0;
+    const mismatchCount = outcome.data.mismatchCount ?? 0;
+    toast({
+      title: mismatchCount === 0 ? "All signatures verified" : "Mismatches found",
+      description: `Checked ${checked} signature${checked === 1 ? "" : "s"}, ${mismatchCount} mismatch${mismatchCount === 1 ? "" : "es"}.`,
+      variant: mismatchCount === 0 ? "default" : "destructive",
+    });
   };
 
   if (loading || !settings) {
@@ -358,7 +430,15 @@ const AdminLabSettingsTab: React.FC = () => {
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="rounded-md border border-border bg-muted/40 p-3 font-mono text-xs text-muted-foreground">
-              {settings.lastVerification.at ? (
+              {sweepProgress ? (
+                <>
+                  scanning · {sweepProgress.reportsScanned} report
+                  {sweepProgress.reportsScanned === 1 ? "" : "s"} so far
+                  <br />
+                  {sweepProgress.checked} signatures checked, {sweepProgress.mismatches} mismatch
+                  {sweepProgress.mismatches === 1 ? "" : "es"}
+                </>
+              ) : settings.lastVerification.at ? (
                 <>
                   last verified · {new Date(settings.lastVerification.at).toLocaleString()}
                   <br />

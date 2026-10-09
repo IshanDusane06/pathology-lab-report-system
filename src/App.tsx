@@ -4,6 +4,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/context/AuthContext";
+import { JobEventsProvider } from "@/context/JobEventsContext";
 
 // Pages
 import Index from "./pages/Index";
@@ -64,6 +65,10 @@ const App = () => (
   <BrowserRouter>
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
+        {/* Inside AuthProvider (it needs to know when there's a session to
+            stream for) and inside BrowserRouter (it stays off the headless
+            PDF renderer's /export route — see the provider's comment). */}
+        <JobEventsProvider>
         <TooltipProvider>
           <Toaster />
           <Sonner />
@@ -181,6 +186,7 @@ const App = () => (
             <Route path="*" element={<NotFound />} />
           </Routes>
         </TooltipProvider>
+        </JobEventsProvider>
       </AuthProvider>
     </QueryClientProvider>
   </BrowserRouter>

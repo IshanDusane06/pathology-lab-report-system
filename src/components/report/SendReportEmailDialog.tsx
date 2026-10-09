@@ -13,7 +13,9 @@ import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Mail, Paperclip, Eye, Loader2 } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
-import { reportsApi, IRelatedReport } from "@/services/reportsApi";
+import { reportsApi, IRelatedReport, QueuedEmail } from "@/services/reportsApi";
+import { usePdfJob, writeTabPlaceholder } from "@/hooks/usePdfJob";
+import { useJobOutcome } from "@/hooks/useJobOutcome";
 
 // Mirrors the server's check — catches typos without rejecting valid but
 // unusual addresses. The server validates independently regardless.
@@ -50,6 +52,8 @@ const SendReportEmailDialog: React.FC<SendReportEmailDialogProps> = ({
   // too — "all" is tracked separately since it drives its own button label.
   const [previewingIds, setPreviewingIds] = useState<Set<string>>(new Set());
   const [previewingAll, setPreviewingAll] = useState(false);
+  const { requestPdf } = usePdfJob();
+  const { waitForJob } = useJobOutcome();
 
   useEffect(() => {
     if (!open || !reportId) return;
@@ -84,12 +88,17 @@ const SendReportEmailDialog: React.FC<SendReportEmailDialogProps> = ({
   // preview, so it opens inline rather than forcing a save like Download PDF
   // does. The blank tab is opened synchronously, inside the click handler's
   // call stack, and filled in once the PDF is ready; opening it only after
-  // the await would read as script-initiated to most popup blockers.
+  // the await would read as script-initiated to most popup blockers. Since
+  // the render is queued now, that wait is seconds rather than one request —
+  // hence the placeholder, so the tab isn't a blank page the whole time.
   const previewOne = async (report: IRelatedReport) => {
     const tab = window.open("", "_blank");
+    writeTabPlaceholder(tab);
     setPreviewingIds((prev) => new Set(prev).add(report._id));
     try {
-      const blob = await reportsApi.getReportPdf(report._id);
+      const { blob } = await requestPdf(report._id, [], {
+        onQueued: (job) => writeTabPlaceholder(tab, job.filename),
+      });
       const url = URL.createObjectURL(blob);
       if (tab) tab.location.href = url;
       else {
@@ -123,9 +132,12 @@ const SendReportEmailDialog: React.FC<SendReportEmailDialogProps> = ({
   const handlePreviewAll = async () => {
     if (!primary) return;
     const tab = window.open("", "_blank");
+    writeTabPlaceholder(tab);
     setPreviewingAll(true);
     try {
-      const blob = await reportsApi.getReportPdf(primary._id, selectedIds);
+      const { blob } = await requestPdf(primary._id, selectedIds, {
+        onQueued: (job) => writeTabPlaceholder(tab, job.filename),
+      });
       const url = URL.createObjectURL(blob);
       if (tab) tab.location.href = url;
       else {
@@ -162,24 +174,62 @@ const SendReportEmailDialog: React.FC<SendReportEmailDialogProps> = ({
 
     setSending(true);
     setError(null);
+
+    let queued: QueuedEmail;
     try {
-      const result = await reportsApi.emailReport(reportId, {
+      queued = await reportsApi.emailReport(reportId, {
         recipient: trimmed,
         includeReportIds: selectedIds,
       });
-      toast({
-        title: "Report sent",
-        description: `${result.attachments} report${result.attachments === 1 ? "" : "s"} sent to ${result.recipient}.`,
-      });
-      onSent?.();
-      onOpenChange(false);
     } catch (err) {
       // Kept inline rather than as a toast so the entered recipient survives
       // and a retry doesn't start from scratch.
       setError(err instanceof Error ? err.message : "Failed to send the report email.");
-    } finally {
       setSending(false);
+      return;
     }
+
+    // This response means *accepted for sending*, not sent — the send runs as
+    // a background job. So the dialog closes now and the real outcome arrives
+    // in a second toast once the job reports back.
+    setSending(false);
+    onOpenChange(false);
+    toast({
+      title: queued.deduped ? "Already sending" : "Queued for sending",
+      description: queued.deduped
+        ? `This report is already on its way to ${queued.recipient}.`
+        : `${queued.attachments} report${queued.attachments === 1 ? "" : "s"} going to ${queued.recipient}…`,
+    });
+
+    const outcome = await waitForJob({ activityId: queued.activityId, jobId: queued.jobId });
+
+    if (outcome.kind === "timeout") {
+      // The send is most likely still running. Saying it failed would be a
+      // guess, and the durable record is the honest place to look.
+      toast({
+        title: "Still sending",
+        description: `This is taking longer than usual. The outcome is recorded against the report either way.`,
+      });
+      return;
+    }
+
+    if (outcome.kind === "failed") {
+      toast({
+        title: "Couldn't send the report",
+        description: outcome.reason,
+        variant: "destructive",
+      });
+    } else {
+      toast({
+        title: "Report sent",
+        description: `${queued.attachments} report${queued.attachments === 1 ? "" : "s"} sent to ${queued.recipient}.`,
+      });
+    }
+
+    // Deliberately only now, not at queue time: this refreshes the report's
+    // delivery history, and at queue time the delivery record doesn't exist
+    // yet. Failures are recorded there too, so it runs for both outcomes.
+    onSent?.();
   };
 
   const attachmentCount = 1 + selectedIds.length;

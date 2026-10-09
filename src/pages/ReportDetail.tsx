@@ -30,6 +30,7 @@ import { groupParametersBySection } from "@/lib/reportSections";
 import { FieldFormat } from "@/components/report/ReportFieldInput";
 import { canEditReportContent, canDeleteReport } from "@/lib/reportAccess";
 import SendReportEmailDialog from "@/components/report/SendReportEmailDialog";
+import { usePdfJob, saveBlobAs } from "@/hooks/usePdfJob";
 import LinkPatientDialog from "@/components/patient/LinkPatientDialog";
 import { Link2 } from "lucide-react";
 
@@ -117,22 +118,18 @@ const ReportDetail: React.FC = () => {
   const [downloadingPdf, setDownloadingPdf] = useState(false);
   // Top-level Report field, deliberately not part of patientInfo state.
   const [patientEmail, setPatientEmail] = useState<string>("");
+  const { requestPdf } = usePdfJob();
 
-  // The PDF is rendered server-side, so this is a real fetch rather than a
-  // client-side capture — hence the loading state on the button.
+  // The PDF is rendered server-side as a background job, so this waits for
+  // the render to finish and then downloads it — hence the loading state on
+  // the button. The filename comes from the server rather than being
+  // re-derived here, so it matches what an emailed copy is called.
   const handleDownloadPdf = async () => {
     if (!id) return;
     setDownloadingPdf(true);
     try {
-      const blob = await reportsApi.getReportPdf(id);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `${(report?.patientInfo?.name || "report").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${report?.reportTypeCode || "report"}.pdf`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
+      const { blob, filename } = await requestPdf(id);
+      saveBlobAs(blob, filename);
     } catch (error) {
       toast({
         title: "Couldn't generate the PDF",

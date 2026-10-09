@@ -126,6 +126,52 @@ export interface IReport {
     updatedAt?: string;  // auto-generated
 }
 
+// Emailing and PDF rendering are background jobs, so these responses are
+// 202-accepted receipts, NOT results. `activityId` identifies this one user
+// action (the durable JobActivity row) and is the key to match the live SSE
+// event against; `jobId` is a content hash, so a repeat of the same request
+// reuses it and is NOT unique per action.
+//
+// `deduped` means an identical request was already in flight and this one
+// joined it rather than starting a second — a double-click or a second tab,
+// not an error.
+export interface QueuedJob {
+    jobId: string;
+    activityId: string | null;
+    status: 'queued';
+    deduped: boolean;
+}
+
+export interface PdfJob extends QueuedJob {
+    filename: string;
+}
+
+export interface QueuedEmail extends QueuedJob {
+    recipient: string;
+    // Reports included, not literal files — the email always carries exactly
+    // one merged PDF.
+    attachments: number;
+}
+
+export interface PdfJobState {
+    jobId: string;
+    // Raw BullMQ state. Note 'delayed' is what a job sits in between a failed
+    // attempt and its retry, so only 'failed' means terminally failed.
+    state:
+    | 'completed'
+    | 'failed'
+    | 'active'
+    | 'waiting'
+    | 'waiting-children'
+    | 'delayed'
+    | 'prioritized'
+    | 'paused'
+    | 'unknown';
+    progress?: unknown;
+    returnvalue?: { resultKey?: string; filename?: string; bytes?: number } | null;
+    failedReason?: string | null;
+}
+
 export const reportsApi = {
     createReport: async (report: IReport) => {
         try {
@@ -464,8 +510,6 @@ export const reportsApi = {
         }
     },
 
-    // Server-rendered PDF of a signed report. Returns a Blob rather than the
-    // usual {success,data} envelope — the response body is the file itself.
     /**
      * Link a historical report to a patient. The report's signed patientInfo
      * snapshot is never rewritten — an already-signed report keeps rendering
@@ -494,16 +538,69 @@ export const reportsApi = {
         }
     },
 
-    // includeReportIds merges other signed reports for the same linked
-    // patient into one combined PDF (same set the "also attach" picker
-    // offers, validated server-side the same way POST /:id/email is).
-    // Omitted, this is the plain single-report download, unchanged.
-    getReportPdf: async (reportId: string, includeReportIds?: string[]): Promise<Blob> => {
+    // Queues a server-side render and returns immediately — the bytes come
+    // later from getPdfJobResult, once the job reports completion (over SSE,
+    // or via getPdfJobState as a backstop). `filename` is known up front, so
+    // the UI can name the file before rendering has even started.
+    //
+    // includeReportIds merges other signed reports for the same linked patient
+    // into one combined PDF (the same set the "also attach" picker offers,
+    // validated server-side exactly as POST /:id/email validates it).
+    createPdfJob: async (reportId: string, includeReportIds: string[] = []): Promise<PdfJob> => {
         try {
-            const query = includeReportIds && includeReportIds.length
-                ? `?include=${includeReportIds.map(encodeURIComponent).join(',')}`
-                : '';
-            const response = await fetch(`${API_BASE_URL}/reports/${reportId}/pdf${query}`, {
+            const response = await fetch(`${API_BASE_URL}/reports/${reportId}/pdf-jobs`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${localStorage.getItem('patho_token')}`,
+                },
+                body: JSON.stringify({ includeReportIds }),
+            });
+            const data = await response.json();
+
+            if (!response.ok || !data.success) {
+                throw new Error(data.message || 'Failed to start the PDF render');
+            }
+
+            return data.data;
+        } catch (error) {
+            console.error('Error starting PDF render:', error);
+            throw error;
+        }
+    },
+
+    // Polled as a backstop to the live SSE event, for the cases where the push
+    // never arrives (pub/sub down, stream blocked by a proxy). 404 means
+    // BullMQ has already reaped the job record, not that anything failed.
+    getPdfJobState: async (jobId: string): Promise<PdfJobState> => {
+        try {
+            const response = await fetch(`${API_BASE_URL}/reports/pdf-jobs/${jobId}`, {
+                headers: {
+                    'Authorization': `Bearer ${localStorage.getItem('patho_token')}`,
+                },
+            });
+            const data = await response.json();
+
+            if (!response.ok || !data.success) {
+                const err = new Error(data.message || 'Failed to read the PDF job') as Error & { status?: number };
+                err.status = response.status;
+                throw err;
+            }
+
+            return data.data;
+        } catch (error) {
+            console.error('Error reading PDF job state:', error);
+            throw error;
+        }
+    },
+
+    // The rendered bytes. Strictly single-use: the server deletes the blob the
+    // moment it has been sent, and it expires 10 minutes after rendering. So a
+    // 410 means "already taken, or the window closed" rather than a real
+    // failure — status is attached so callers can re-render instead.
+    getPdfJobResult: async (jobId: string): Promise<Blob> => {
+        try {
+            const response = await fetch(`${API_BASE_URL}/reports/pdf-jobs/${jobId}/result`, {
                 headers: {
                     'Authorization': `Bearer ${localStorage.getItem('patho_token')}`,
                 },
@@ -511,19 +608,21 @@ export const reportsApi = {
 
             if (!response.ok) {
                 // Errors still come back as JSON even though success is a PDF.
-                let message = 'Failed to generate the report PDF';
+                let message = 'Failed to fetch the rendered PDF';
                 try {
                     const data = await response.json();
                     message = data.message || message;
                 } catch (_) {
                     // Non-JSON error body — keep the default message.
                 }
-                throw new Error(message);
+                const err = new Error(message) as Error & { status?: number };
+                err.status = response.status;
+                throw err;
             }
 
             return await response.blob();
         } catch (error) {
-            console.error('Error downloading report PDF:', error);
+            console.error('Error fetching rendered PDF:', error);
             throw error;
         }
     },
@@ -559,10 +658,14 @@ export const reportsApi = {
         }
     },
 
+    // Queues the send. A resolved promise means "accepted for sending", NOT
+    // "sent" — the outcome arrives later as an SSE job event. Pass
+    // retryOfActivityId when re-sending a failed row so the server links the
+    // two and stops counting the old one as needing attention.
     emailReport: async (
         reportId: string,
-        options: { recipient?: string; includeReportIds?: string[] } = {}
-    ): Promise<{ sent: boolean; recipient: string; messageId?: string; attachments: number }> => {
+        options: { recipient?: string; includeReportIds?: string[]; retryOfActivityId?: string } = {}
+    ): Promise<QueuedEmail> => {
         try {
             const response = await fetch(`${API_BASE_URL}/reports/${reportId}/email`, {
                 method: 'POST',
